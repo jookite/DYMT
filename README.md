@@ -30,24 +30,11 @@
 ```
 hwp-auto-print/
 │
-├─ main.py                # 프로그램 실행 파일
-├─ printer_controller.py  # 프린터 제어 로직
-├─ hwp_parser.py          # 한글 문서 미주 탐색 로직
-├─ file_processor.py      # 폴더 내 파일 순차 처리
-│
-├─ ui/
-│   ├─ app.py             # GUI 구성
-│   └─ components.py      # UI 컴포넌트
-│
-├─ utils/
-│   ├─ admin.py           # 관리자 권한 확인
-│   └─ logger.py          # 로그 관리
-│
-├─ assets/
-│   └─ icon.ico           # 프로그램 아이콘
-│
-├─ requirements.txt       # 파이썬 의존성
-└─ README.md              # 프로젝트 설명
+├─ start2zero.py # 프로그램 실행 파일
+├─ requirements.txt # 파이썬 의존성
+├─ ReadMe_설정가이드.txt # 프린터 설정 및 사용 가이드
+├─ README.md # 프로젝트 설명
+└─ .gitignore # Git 제외 파일 설정
 ```
 
 # • 사전 프린터 설정 (필독)
@@ -101,5 +88,5 @@ hwp-auto-print/
 ## 2️⃣ 프로그램 실행
 
 ```bash
-python main.py
+python start2zero.py
 ```

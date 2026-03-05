@@ -216,16 +216,18 @@ class App:
             if split_page > 1:
                 body_end = split_page - 1
                 body_range = f"1-{body_end}"
+                print_set.SetItem("UsingPagenum", 0)
                 print_set.SetItem("PrinterName", PRINTER_NAME1)
                 print_set.SetItem("Range", 4)
                 print_set.SetItem("RangeCustom", body_range)
                 print_act.Execute(print_set)
                 self.log(f"   🖨️ 본문 인쇄: {body_range}쪽 -> {PRINTER_NAME1}")
-                time.sleep(1.0) # 인쇄 작업 전송 대기
+                # time.sleep(1.0) # 인쇄 작업 전송 대기
 
             # 2. 답지 인쇄 (1번 미주 페이지 ~ 마지막 페이지)
             if split_page <= total_pages:
                 answer_range = f"{split_page}-{total_pages}"
+                print_set.SetItem("UsingPagenum", 0)
                 print_set.SetItem("PrinterName", PRINTER_NAME2)
                 print_set.SetItem("Range", 4)
                 print_set.SetItem("RangeCustom", answer_range)

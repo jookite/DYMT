@@ -10,7 +10,7 @@ import pythoncom
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("DYMT_HWP(오답노트) 자동 분할 인쇄 도구")
+        self.root.title("오답노트 자동 분할 인쇄 도구")
         self.root.geometry("600x650")
 
         self.stop_flag = False

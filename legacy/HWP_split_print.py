@@ -12,7 +12,7 @@ import pythoncom
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("한글 문서 본문/답지 분할 인쇄 도구")
+        self.root.title("강다영수학 프린트 도우미")
         self.root.geometry("680x740")
         self.root.minsize(620, 620)
 
@@ -179,8 +179,15 @@ class App:
         tk.Spinbox(row, from_=0, to=999, width=4,
                    textvariable=answer_var).pack(side="left", padx=2)
 
+        # 답지를 몇 번 문제의 답까지만 인쇄할지 (비우면 전체)
+        upto_var = tk.StringVar(value="")
+        tk.Label(row, text="~번").pack(side="left", padx=(6, 0))
+        tk.Spinbox(row, from_=1, to=999, width=4,
+                   textvariable=upto_var).pack(side="left", padx=2)
+
         entry = {'path': path, 'body_var': body_var,
-                 'answer_var': answer_var, 'split_var': split_var, 'row': row}
+                 'answer_var': answer_var, 'split_var': split_var,
+                 'upto_var': upto_var, 'row': row}
         tk.Button(row, text="✕", width=3,
                   command=lambda: self._remove_entry(entry)).pack(side="right",
                                                                   padx=4)
@@ -233,15 +240,19 @@ class App:
 
         # 작업 데이터를 메인 스레드에서 미리 수집 (tkinter 변수는 워커에서 접근 X)
         try:
-            jobs = [(e['path'],
-                     max(0, int(e['body_var'].get().strip())),
-                     max(0, int(e['answer_var'].get().strip())),
-                     e['split_var'].get())
-                    for e in self.file_entries]
+            jobs = []
+            for e in self.file_entries:
+                upto_str = e['upto_var'].get().strip()
+                jobs.append((e['path'],
+                             max(0, int(e['body_var'].get().strip())),
+                             max(0, int(e['answer_var'].get().strip())),
+                             e['split_var'].get(),
+                             int(upto_str) if upto_str else None))
         except ValueError:
             messagebox.showwarning(
                 "입력 오류",
-                "부수 값에 숫자가 아닌 문자가 포함되어 있습니다. 확인 후 다시 시도해주세요.")
+                "부수/번호 값에 숫자가 아닌 문자가 포함되어 있습니다. "
+                "확인 후 다시 시도해주세요.")
             return
 
         self.stop_flag = False
@@ -269,22 +280,27 @@ class App:
 
             total = len(jobs)
             success = 0
-            for i, (path, body_copies, answer_copies, do_split) in enumerate(jobs):
+            for i, (path, body_copies, answer_copies, do_split,
+                    answer_upto) in enumerate(jobs):
                 if self.stop_flag:
                     self.log("⚠️ 사용자 요청으로 중단했습니다.")
                     break
 
                 filename = os.path.basename(path)
                 mode_label = "분할" if do_split else "전체"
+                upto_label = (f" / 답지 {answer_upto}번까지"
+                              if answer_upto else "")
                 self.update_progress((i / total) * 100)
                 self.update_status(f"처리 중: {filename}")
                 self.log(f"📄 [{i + 1}/{total}] {filename} "
                          f"[{mode_label}] "
-                         f"(본문 {body_copies}부 / 답지 {answer_copies}부)")
+                         f"(본문 {body_copies}부 / 답지 {answer_copies}부"
+                         f"{upto_label})")
 
                 if self.process_single_file(hwp, path, body_copies,
                                             answer_copies, do_split,
-                                            printer_body, printer_answer):
+                                            printer_body, printer_answer,
+                                            answer_upto=answer_upto):
                     success += 1
 
             self.update_progress(100)
@@ -306,7 +322,8 @@ class App:
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
 
     def process_single_file(self, hwp, file_path, body_copies, answer_copies,
-                            do_split, printer_body, printer_answer):
+                            do_split, printer_body, printer_answer,
+                            answer_upto=None):
         try:
             if not hwp.Open(file_path, "", ""):
                 self.log("   ❌ 파일을 열지 못했습니다.")
@@ -332,7 +349,8 @@ class App:
 
                 result = self.execute_print(hwp, split_page, total_pages,
                                             printer_body, printer_answer,
-                                            body_copies, answer_copies)
+                                            body_copies, answer_copies,
+                                            answer_upto=answer_upto)
             else:
                 # 전체 인쇄 모드 — 미주 분할 없이 전체 페이지를 양쪽 프린터로
                 self.log(f"   📑 전체 인쇄 모드 ({total_pages}쪽)")
@@ -351,26 +369,133 @@ class App:
             return False
 
     def find_split_page_by_first_endnote(self, hwp, total_pages):
-        """문서의 첫 번째 미주를 찾아 그 페이지 번호를 반환 (없으면 None)."""
-        self.log("   🔍 분할 위치(미주) 탐색 중...")
-        split_page = None
+        """첫 미주 내용이 시작되는 실제(물리) 쪽 번호를 계산 (없으면 None).
 
+        KeyIndicator()의 쪽 번호는 '새 쪽번호'가 적용된 표시 번호라
+        그대로 쓰면 번호를 다시 시작하는 문서에서 분할 지점이 틀어진다.
+        미주 영역이 문서 끝에 이어붙는 점을 이용해
+        (전체 쪽수 - 미주 영역 쪽수 + 1)로 실제 쪽 번호를 계산한다.
+        """
+        self.log("   🔍 분할 위치(미주) 탐색 중...")
+
+        def note_shown_page(ctrl, at_end=False):
+            hwp.SetPosBySet(ctrl.GetAnchorPos(0))
+            hwp.Run("NoteModify")        # 미주 내용 위치로 이동
+            if at_end:
+                hwp.Run("MoveSelListEnd")
+            page = hwp.KeyIndicator()[3]
+            if at_end:
+                hwp.Run("Cancel")
+            hwp.Run("CloseUpper")        # 본문으로 복귀
+            return page
+
+        def squash(text):
+            return "".join(str(text).split())
+
+        def page_text(page):
+            """물리 쪽(1부터)의 본문 텍스트 (미주 내용은 포함되지 않음)."""
+            try:
+                return squash(hwp.GetPageText(page - 1, -1))
+            except Exception:
+                return ""
+
+        items = []
         ctrl = hwp.HeadCtrl
         while ctrl:
-            if ctrl.CtrlID == "en":  # 미주 컨트롤
-                try:
-                    hwp.SetPosBySet(ctrl.GetAnchorPos(0))
-                    hwp.Run("NoteModify")
-                    info = hwp.KeyIndicator()
-                    split_page = info[3]  # 페이지 번호
-                    hwp.Run("CloseUpper")  # 본문으로 복귀
-                    self.log(f"   📍 분할 지점: {split_page}쪽")
-                    break
-                except Exception as e:
-                    self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
+            items.append((ctrl.CtrlID, ctrl))
             ctrl = ctrl.Next
+        en_idx = [i for i, (cid, _) in enumerate(items) if cid == "en"]
+        if not en_idx:
+            return None
+        first_en = items[en_idx[0]][1]
+        last_en = items[en_idx[-1]][1]
+        boundary = next((c for i, (cid, c) in enumerate(items)
+                         if cid in ("secd", "nwno") and i > en_idx[-1]), None)
 
-        return split_page
+        def split_by_span():
+            """예비 방식: (전체 쪽수 - 답지 영역 쪽수 + 1). 영역 쪽수는
+            표시 번호의 차이로 구하므로 '새 쪽번호' 오프셋이 상쇄된다."""
+            end_shown = note_shown_page(last_en, at_end=True)
+            if boundary is not None:
+                hwp.SetPosBySet(boundary.GetAnchorPos(0))
+                start_shown = hwp.KeyIndicator()[3]
+            else:
+                start_shown = note_shown_page(first_en)
+            tail_pages = end_shown - start_shown + 1
+            if not 1 <= tail_pages <= total_pages:
+                raise ValueError(
+                    f"답지 영역 계산 이상 (표시 번호 시작 {start_shown}쪽 / "
+                    f"끝 {end_shown}쪽 / 전체 {total_pages}쪽)")
+            split_page = total_pages - tail_pages + 1
+            self.log(f"   📍 분할 지점: {split_page}쪽 (표시 번호 기준)")
+            return split_page
+
+        try:
+            last_body = None
+            for pg in range(total_pages, 0, -1):
+                if page_text(pg):
+                    last_body = pg
+                    break
+            if last_body is None or last_body == total_pages:
+                # 모든 쪽에 글자가 있음(머리말 등) — 표시 번호 방식으로 대체
+                return split_by_span()
+
+            def is_cover(pg):
+                head = page_text(pg)[:100]
+                return any(k in head for k in ("정답", "해설", "답지"))
+
+            if is_cover(last_body):
+                # 답지 앞부분(표지·빠른정답 등)이 본문 텍스트로 여러 쪽
+                # 이어질 수 있어, 키워드가 나오는 동안 최대 4쪽까지 소급
+                split_page = last_body
+                for pg in range(last_body - 1, max(0, last_body - 4), -1):
+                    if is_cover(pg):
+                        split_page = pg
+                    else:
+                        break
+                basis = "답지 표지 기준"
+            else:
+                split_page = last_body + 1    # 본문 다음 쪽부터
+                basis = "본문 끝 기준"
+            self.log(f"   📍 분할 지점: {split_page}쪽 ({basis})")
+            return split_page
+        except Exception as e:
+            self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
+            return None
+
+    def find_answer_end_page(self, hwp, upto_num, total_pages):
+        """upto_num번째 미주(문제)의 답이 끝나는 실제 쪽 번호.
+
+        마지막 미주의 끝이 문서 마지막 쪽이라는 점을 기준으로,
+        표시 번호의 차이만큼 문서 끝에서 되짚어 계산한다.
+        문제 수 이상을 지정했거나 계산이 안 되면 None (→ 답지 전체 인쇄).
+        """
+        def note_end_shown(ctrl):
+            hwp.SetPosBySet(ctrl.GetAnchorPos(0))
+            hwp.Run("NoteModify")
+            hwp.Run("MoveSelListEnd")
+            page = hwp.KeyIndicator()[3]
+            hwp.Run("Cancel")
+            hwp.Run("CloseUpper")
+            return page
+
+        ens = []
+        ctrl = hwp.HeadCtrl
+        while ctrl:
+            if ctrl.CtrlID == "en":
+                ens.append(ctrl)
+            ctrl = ctrl.Next
+        if not ens or upto_num < 1 or upto_num >= len(ens):
+            return None
+        try:
+            end_shown = note_end_shown(ens[-1])
+            k_shown = note_end_shown(ens[upto_num - 1])
+            page = total_pages - (end_shown - k_shown)
+            if not 1 <= page <= total_pages:
+                return None
+            return page
+        except Exception:
+            return None
 
     def _print_range(self, print_act, print_set, printer_name, page_range,
                      copies):
@@ -386,8 +511,22 @@ class App:
         time.sleep(0.5)  # 인쇄 작업 전송 대기
 
     def execute_print(self, hwp, split_page, total_pages, printer_body,
-                      printer_answer, body_copies, answer_copies):
+                      printer_answer, body_copies, answer_copies,
+                      answer_upto=None):
         try:
+            # 답지 마지막 쪽 결정 — 기본은 문서 끝, ~번까지 지정 시 해당 답 끝 쪽
+            answer_last = total_pages
+            upto_label = ""
+            if answer_upto:
+                end_pg = self.find_answer_end_page(hwp, answer_upto,
+                                                   total_pages)
+                if end_pg is not None and end_pg >= split_page:
+                    answer_last = end_pg
+                    upto_label = f" ({answer_upto}번까지)"
+                else:
+                    self.log(f"   ⚠️ '{answer_upto}번까지' 지정이 문제 수 "
+                             f"이상이거나 계산할 수 없어 답지 전체를 인쇄합니다.")
+
             print_act = hwp.CreateAction("Print")
             print_set = print_act.CreateSet()
 
@@ -400,13 +539,13 @@ class App:
             elif body_copies == 0:
                 self.log("   ⏭️ 본문 0부 — 건너뜀")
 
-            # 2) 답지: split_page쪽 ~ 마지막쪽
-            if split_page <= total_pages and answer_copies > 0:
-                answer_range = f"{split_page}-{total_pages}"
+            # 2) 답지: split_page쪽 ~ 답지 마지막 쪽
+            if split_page <= answer_last and answer_copies > 0:
+                answer_range = f"{split_page}-{answer_last}"
                 self._print_range(print_act, print_set, printer_answer,
                                   answer_range, answer_copies)
-                self.log(f"   🖨️ 답지 {answer_range}쪽 · {answer_copies}부 "
-                         f"→ {printer_answer}")
+                self.log(f"   🖨️ 답지 {answer_range}쪽{upto_label} · "
+                         f"{answer_copies}부 → {printer_answer}")
             elif answer_copies == 0:
                 self.log("   ⏭️ 답지 0부 — 건너뜀")
 

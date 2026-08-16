@@ -5,3 +5,6 @@ build/
 dist/
 *.spec
 *.iml
+
+# 검토용 교재 예제 파일 (저작물 — 저장소에 올리지 않음)
+samples/

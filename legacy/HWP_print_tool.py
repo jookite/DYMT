@@ -46,27 +46,110 @@ class HwpPrinter:
             self.hwp = None
 
     # ---------- 미주 탐색 ----------
-    def find_split_page_by_first_endnote(self):
-        """문서의 첫 번째 미주를 찾아 그 페이지 번호를 반환 (없으면 None)."""
-        self.log("   🔍 분할 위치(미주) 탐색 중...")
-        split_page = None
+    def _note_shown_page(self, ctrl, at_end=False):
+        """미주 내용의 시작(또는 끝) 위치에 표시되는 쪽 번호."""
+        self.hwp.SetPosBySet(ctrl.GetAnchorPos(0))
+        self.hwp.Run("NoteModify")        # 미주 내용 위치로 이동
+        if at_end:
+            self.hwp.Run("MoveSelListEnd")
+        page = self.hwp.KeyIndicator()[3]
+        if at_end:
+            self.hwp.Run("Cancel")
+        self.hwp.Run("CloseUpper")        # 본문으로 복귀
+        return page
 
+    COVER_KEYWORDS = ("정답", "해설", "답지")  # 답지 표지 제목에 흔한 단어
+
+    @staticmethod
+    def _squash(text):
+        return "".join(str(text).split())
+
+    def _page_text(self, page):
+        """물리 쪽(1부터)의 본문 텍스트 (미주 내용은 포함되지 않음)."""
+        try:
+            return self._squash(self.hwp.GetPageText(page - 1, -1))
+        except Exception:
+            return ""
+
+    def find_split_page_by_first_endnote(self):
+        """답지가 시작되는 실제(물리) 쪽 번호를 계산 (미주 없으면 None).
+
+        GetPageText()는 미주 내용을 제외한 본문 텍스트를 물리 쪽 단위로
+        돌려주므로, 문서 끝에서부터 본문 텍스트가 남아 있는 마지막 쪽(E)을
+        찾는다. E 첫머리에 '정답/해설/답지' 류 제목이 있으면 답지 표지로
+        보고 E부터, 아니면 본문 마지막 쪽이므로 E+1부터를 답지로 삼는다.
+        모든 쪽에 글자가 있으면(머리말 등) 표시 번호 차이 방식으로 대체.
+        """
+        self.log("   🔍 분할 위치(미주) 탐색 중...")
+
+        items = []
         ctrl = self.hwp.HeadCtrl
         while ctrl:
-            if ctrl.CtrlID == "en":  # 미주 컨트롤
-                try:
-                    self.hwp.SetPosBySet(ctrl.GetAnchorPos(0))
-                    self.hwp.Run("NoteModify")
-                    info = self.hwp.KeyIndicator()
-                    split_page = info[3]  # 페이지 번호
-                    self.hwp.Run("CloseUpper")  # 본문으로 복귀
-                    self.log(f"   📍 분할 지점: {split_page}쪽")
-                    break
-                except Exception as e:
-                    self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
+            items.append((ctrl.CtrlID, ctrl))
             ctrl = ctrl.Next
+        en_idx = [i for i, (cid, _) in enumerate(items) if cid == "en"]
+        if not en_idx:
+            return None
+        first_en = items[en_idx[0]][1]
+        last_en = items[en_idx[-1]][1]
+        boundary = next((c for i, (cid, c) in enumerate(items)
+                         if cid in ("secd", "nwno") and i > en_idx[-1]), None)
 
-        return split_page
+        try:
+            total_pages = self.hwp.PageCount
+            last_body = None
+            for pg in range(total_pages, 0, -1):
+                if self._page_text(pg):
+                    last_body = pg
+                    break
+            if last_body is None or last_body == total_pages:
+                return self._split_by_span(first_en, last_en, boundary,
+                                           total_pages)
+
+            def is_cover(pg):
+                head = self._page_text(pg)[:100]
+                return any(k in head for k in self.COVER_KEYWORDS)
+
+            if is_cover(last_body):
+                # 답지 앞부분(표지·빠른정답 등)이 본문 텍스트로 여러 쪽
+                # 이어질 수 있어, 키워드가 나오는 동안 최대 4쪽까지 소급
+                split_page = last_body
+                for pg in range(last_body - 1, max(0, last_body - 4), -1):
+                    if is_cover(pg):
+                        split_page = pg
+                    else:
+                        break
+                basis = "답지 표지 기준"
+            else:
+                split_page = last_body + 1    # 본문 다음 쪽부터
+                basis = "본문 끝 기준"
+            self.log(f"   📍 분할 지점: {split_page}쪽 ({basis})")
+            return split_page
+        except Exception as e:
+            self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
+            return None
+
+    def _split_by_span(self, first_en, last_en, boundary, total_pages):
+        """예비 방식: (전체 쪽수 - 답지 영역 쪽수 + 1). 영역 쪽수는
+        표시 번호의 차이로 구하므로 '새 쪽번호' 오프셋이 상쇄된다."""
+        try:
+            end_shown = self._note_shown_page(last_en, at_end=True)
+            if boundary is not None:
+                self.hwp.SetPosBySet(boundary.GetAnchorPos(0))
+                start_shown = self.hwp.KeyIndicator()[3]
+            else:
+                start_shown = self._note_shown_page(first_en)
+            tail_pages = end_shown - start_shown + 1
+            if not 1 <= tail_pages <= total_pages:
+                raise ValueError(
+                    f"답지 영역 계산 이상 (표시 번호 시작 {start_shown}쪽 / "
+                    f"끝 {end_shown}쪽 / 전체 {total_pages}쪽)")
+            split_page = total_pages - tail_pages + 1
+            self.log(f"   📍 분할 지점: {split_page}쪽 (표시 번호 기준)")
+            return split_page
+        except Exception as e:
+            self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
+            return None
 
     # ---------- 인쇄 ----------
     def _print_range(self, print_act, print_set, printer_name, page_range,

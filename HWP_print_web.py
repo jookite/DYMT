@@ -26,7 +26,6 @@
 
 import os
 import queue
-import socket
 import tempfile
 import threading
 import time
@@ -225,8 +224,23 @@ class HwpPrinter:
         time.sleep(0.5)  # 인쇄 작업 전송 대기
 
     def execute_print(self, split_page, total_pages, printer_body,
-                      printer_answer, body_copies, answer_copies):
-        """본문과 답지를 각각 해당 프린터로 보낸다."""
+                      printer_answer, body_copies, answer_copies,
+                      answer_upto=None):
+        """본문과 답지를 각각 해당 프린터로 보낸다.
+
+        answer_upto: 답지를 몇 번 문제의 답까지만 인쇄할지 (None이면 전체).
+        """
+        # 답지 마지막 쪽 결정 — 기본은 문서 끝, ~번까지 지정 시 해당 답 끝 쪽
+        answer_last = total_pages
+        upto_label = ""
+        if answer_upto:
+            end_pg = self.find_answer_end_page(answer_upto, total_pages)
+            if end_pg is not None and end_pg >= split_page:
+                answer_last = end_pg
+                upto_label = f" ({answer_upto}번까지)"
+            else:
+                self.log(f"   ⚠️ '{answer_upto}번까지' 지정이 문제 수 이상이거나 "
+                         f"계산할 수 없어 답지 전체를 인쇄합니다.")
         try:
             print_act = self.hwp.CreateAction("Print")
             print_set = print_act.CreateSet()
@@ -241,13 +255,13 @@ class HwpPrinter:
             elif body_copies == 0:
                 self.log("   ⏭️ 본문 0부 — 건너뜀")
 
-            # 2) 답지: split_page쪽 ~ 마지막쪽
-            if split_page <= total_pages and answer_copies > 0:
-                answer_range = f"{split_page}-{total_pages}"
+            # 2) 답지: split_page쪽 ~ 답지 마지막 쪽
+            if split_page <= answer_last and answer_copies > 0:
+                answer_range = f"{split_page}-{answer_last}"
                 self._print_range(print_act, print_set, printer_answer,
                                   answer_range, answer_copies)
-                self.log(f"   🖨️ 답지 {answer_range}쪽 · {answer_copies}부 "
-                         f"→ {printer_answer}")
+                self.log(f"   🖨️ 답지 {answer_range}쪽{upto_label} · "
+                         f"{answer_copies}부 → {printer_answer}")
             elif answer_copies == 0:
                 self.log("   ⏭️ 답지 0부 — 건너뜀")
 
@@ -287,7 +301,8 @@ class HwpPrinter:
 
     # ---------- 단일 파일 처리 ----------
     def process_file(self, file_path, body_copies, answer_copies, do_split,
-                     printer_body, printer_answer, on_no_endnote=None):
+                     printer_body, printer_answer, on_no_endnote=None,
+                     answer_upto=None):
         """파일 하나를 열어 분할/전체 모드에 따라 인쇄한다."""
         try:
             if not self.hwp.Open(file_path, "", ""):
@@ -310,7 +325,8 @@ class HwpPrinter:
 
                 result = self.execute_print(split_page, total_pages,
                                             printer_body, printer_answer,
-                                            body_copies, answer_copies)
+                                            body_copies, answer_copies,
+                                            answer_upto=answer_upto)
             else:
                 self.log(f"   📑 전체 인쇄 모드 ({total_pages}쪽)")
                 result = self.execute_whole_print(total_pages, printer_body,
@@ -371,18 +387,6 @@ def get_printer_list():
         return []
 
 
-def get_local_ip():
-    """같은 네트워크의 다른 기기에서 접속할 때 쓸 이 PC의 IP."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
 # ============================================================
 # 인쇄 워커 — 서버에 하나만 떠서 대기열을 순서대로 처리
 # ============================================================
@@ -406,22 +410,25 @@ def worker_loop():
 
             total = len(jobs)
             success = 0
-            for i, (path, name, body_copies, answer_copies,
-                    do_split) in enumerate(jobs):
+            for i, (path, name, body_copies, answer_copies, do_split,
+                    answer_upto) in enumerate(jobs):
                 if state.stop_flag:
                     log("⚠️ 중단 요청으로 현재 작업을 멈췄습니다.")
                     break
 
                 mode_label = "분할" if do_split else "전체"
+                upto_label = f" / 답지 {answer_upto}번까지" if answer_upto else ""
                 state.progress = i / total
                 state.status = f"[{label}] 처리 중: {name}"
                 log(f"📄 [{i + 1}/{total}] {name} [{mode_label}] "
-                    f"(본문 {body_copies}부 / 답지 {answer_copies}부)")
+                    f"(본문 {body_copies}부 / 답지 {answer_copies}부"
+                    f"{upto_label})")
 
                 if printer.process_file(path, body_copies, answer_copies,
                                         do_split, batch["printer_body"],
                                         batch["printer_answer"],
-                                        on_no_endnote=skipped_files.append):
+                                        on_no_endnote=skipped_files.append,
+                                        answer_upto=answer_upto):
                     success += 1
 
             state.progress = 1.0
@@ -480,18 +487,26 @@ except Exception:
 if default_printer not in printers:
     default_printer = None
 
-server_ip = get_local_ip()
+# '폴더째로 업로드' 위젯의 파일 선택창을 폴더 선택 모드로 바꾸는 스크립트.
+# Quasar가 입력창을 다시 그려도 유지되도록 MutationObserver로 재적용한다.
+_FOLDER_PICKER_JS = """
+const applyFolderMode = () =>
+    document.querySelectorAll('.folder-uploader input[type="file"]')
+        .forEach(i => { i.setAttribute('webkitdirectory', '');
+                        i.setAttribute('directory', ''); });
+applyFolderMode();
+new MutationObserver(applyFolderMode)
+    .observe(document.body, {subtree: true, childList: true});
+"""
 
 
 @ui.page("/")
-def index():
+async def index():
     file_entries = []      # 이 접속자만의 파일 목록
     seen = {"n": glog.total - len(glog.lines)}  # 로그는 최근 것부터 표시
 
     with ui.column().classes("w-full max-w-3xl mx-auto p-4 gap-3"):
-        ui.label("한글 문서 본문/답지 분할 인쇄").classes("text-xl font-bold")
-        ui.label(f"공용 인쇄 서버 — 다른 기기 접속: http://{server_ip}:{PORT}") \
-            .classes("text-sm text-gray-500")
+        ui.label("강다영수학 프린트 도우미").classes("text-xl font-bold")
 
         # ---------- 이름 / 프린터 ----------
         with ui.card().classes("w-full"):
@@ -511,22 +526,31 @@ def index():
             ui.label("파일 목록 — 파일별로 분할 여부와 부수를 정하세요") \
                 .classes("font-bold")
 
-            def handle_upload(e):
-                name = e.name
+            async def handle_upload(e):
+                # NiceGUI 3.x: 업로드 파일은 e.file (FileUpload 객체)로 전달됨
+                file = e.file
+                name = file.name
                 if not name.lower().endswith((".hwp", ".hwpx")):
                     ui.notify(f"{name}: 한글 파일이 아닙니다", type="warning")
                     return
                 # 여러 사용자의 같은 이름 파일이 안 겹치게 고유 접두어를 붙여 저장
                 dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{name}"
-                content = e.content
-                data = content.read() if hasattr(content, "read") else content
-                dest.write_bytes(data)
+                await file.save(dest)
                 add_file_row(dest, name)
 
-            ui.upload(label="한글 파일 업로드 (.hwp / .hwpx — 여러 개 가능)",
-                      multiple=True, auto_upload=True,
-                      on_upload=handle_upload) \
-                .props('accept=".hwp,.hwpx"').classes("w-full")
+            with ui.row().classes("w-full gap-2 items-start"):
+                upload_files = ui.upload(
+                    label="파일 업로드 (.hwp / .hwpx — 여러 개·드래그 가능)",
+                    multiple=True, auto_upload=True,
+                    on_upload=handle_upload) \
+                    .props('accept=".hwp,.hwpx"').classes("flex-1")
+                # 아래 위젯은 접속 후 JS로 폴더 선택 모드(webkitdirectory)로 전환됨
+                upload_folder = ui.upload(
+                    label="📁 오답노트 폴더 프린트",
+                    multiple=True, auto_upload=True,
+                    on_upload=handle_upload) \
+                    .props('accept=".hwp,.hwpx"') \
+                    .classes("flex-1 folder-uploader")
 
             with ui.row().classes("w-full items-center"):
                 lbl_count = ui.label("총 0개")
@@ -548,14 +572,20 @@ def index():
                             " bg-gray-50") as row:
                         ui.label(display_name).classes("flex-1 truncate")
                         split = ui.switch("분할", value=True).props("dense")
-                        body = ui.number("본문", min=0, max=999, precision=0) \
+                        body = ui.number("본문", value=1, min=0, max=999,
+                                         precision=0) \
                             .classes("w-20").props("outlined dense")
-                        answer = ui.number("답지", min=0, max=999,
+                        answer = ui.number("답지", value=1, min=0, max=999,
                                            precision=0) \
                             .classes("w-20").props("outlined dense")
+                        upto = ui.number("~번까지", min=1, max=999,
+                                         precision=0) \
+                            .classes("w-24").props("outlined dense") \
+                            .tooltip("답지를 몇 번 문제의 답까지만 인쇄할지 "
+                                     "(비우면 답지 전체)")
                         entry = {"path": path, "name": display_name,
                                  "split": split, "body": body,
-                                 "answer": answer, "row": row}
+                                 "answer": answer, "upto": upto, "row": row}
                         ui.button(icon="delete",
                                   on_click=lambda entry=entry:
                                   remove_entry(entry)) \
@@ -576,6 +606,8 @@ def index():
             def clear_files():
                 for entry in list(file_entries):
                     remove_entry(entry)
+                upload_files.reset()   # 업로드 위젯의 전송 내역 표시도 초기화
+                upload_folder.reset()
 
             def set_all_one():
                 for entry in file_entries:
@@ -607,7 +639,8 @@ def index():
             jobs = [(str(e["path"]), e["name"],
                      max(0, int(e["body"].value)),
                      max(0, int(e["answer"].value)),
-                     bool(e["split"].value))
+                     bool(e["split"].value),
+                     int(e["upto"].value) if e["upto"].value else None)
                     for e in file_entries]
 
             # 파일 소유권이 대기열로 넘어가므로 내 목록에서는 행만 제거
@@ -615,6 +648,8 @@ def index():
                 files_container.remove(entry["row"])
             file_entries.clear()
             update_count()
+            upload_files.reset()
+            upload_folder.reset()
 
             job_queue.put({"label": label, "jobs": jobs,
                            "printer_body": pb, "printer_answer": pa})
@@ -655,7 +690,10 @@ def index():
 
         ui.timer(0.3, refresh)
 
+    await ui.context.client.connected()
+    ui.run_javascript(_FOLDER_PICKER_JS)
+
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(host="0.0.0.0", port=PORT, title="한글 분할 인쇄",
+    ui.run(host="0.0.0.0", port=PORT, title="강다영수학 프린트 도우미",
            reload=False, show=True, language="ko-KR")

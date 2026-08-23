@@ -99,7 +99,7 @@ nicegui-pack --onefile --name "강다영수학_프린트도우미" HWP_print_web
 
 ## Lab 연동 (관리자 페이지에서 바로 인쇄)
 
-Lab(`https://app.dayoungmathclass.com`)의 **프린트 도우미** 메뉴는 이 프로그램이
+Lab(`https://lab.dayoungmathclass.com`)의 **프린트 도우미** 메뉴는 이 프로그램이
 실행 중인 PC에서 열면 자동으로 연결됩니다 (`http://127.0.0.1:58021`의 `/api/*`).
 
 - **오답노트 다운로드** 페이지의 `🖨️ 인쇄` 버튼 — ZIP을 내려받거나 압축을 풀

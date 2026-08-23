@@ -9,7 +9,7 @@
   다른 기기:   http://<이 PC의 IP>:58021  (화면 상단에 주소 표시)
 
 Lab 연동
-  - Lab(https://app.dayoungmathclass.com)의 '프린트 도우미' 메뉴가
+  - Lab(https://lab.dayoungmathclass.com)의 '프린트 도우미' 메뉴가
     이 프로그램(127.0.0.1:58021)의 /api/* 창구로 직접 접속해
     파일 업로드·오답노트 ZIP 인쇄·진행 확인을 할 수 있다.
   - 허용된 출처(ALLOWED_ORIGINS)의 요청만 받는다.
@@ -60,7 +60,7 @@ AGENT_VERSION = "1.1.0"
 # 요청을 보낼 수 있게 허용할 출처(Origin) 목록.
 # 여기 없는 사이트가 보낸 API 요청은 거절한다 (악성 사이트의 몰래 인쇄 방지).
 ALLOWED_ORIGINS = [
-    "https://app.dayoungmathclass.com",
+    "https://lab.dayoungmathclass.com",
     # Lab 로컬 개발 서버
     "http://localhost:3000", "http://127.0.0.1:3000",
     "http://localhost:3001", "http://127.0.0.1:3001",
@@ -880,7 +880,7 @@ async def index():
 
 
 # ============================================================
-# Lab 연동 API — Lab(https://app.dayoungmathclass.com) 페이지가
+# Lab 연동 API — Lab(https://lab.dayoungmathclass.com) 페이지가
 # 브라우저에서 http://127.0.0.1:58021 로 직접 호출하는 창구.
 # 브라우저는 localhost 통신을 혼합 콘텐츠 차단 예외로 허용한다.
 # ============================================================

@@ -5,8 +5,14 @@
 같은 네트워크의 여러 사람이 각자 브라우저로 접속해 동시에 사용할 수 있습니다.
 
   실행:        python HWP_print_web.py
-  이 PC에서:   http://localhost:8080
-  다른 기기:   http://<이 PC의 IP>:8080  (화면 상단에 주소 표시)
+  이 PC에서:   http://localhost:58021
+  다른 기기:   http://<이 PC의 IP>:58021  (화면 상단에 주소 표시)
+
+Lab 연동
+  - Lab(https://app.dayoungmathclass.com)의 '프린트 도우미' 메뉴가
+    이 프로그램(127.0.0.1:58021)의 /api/* 창구로 직접 접속해
+    파일 업로드·오답노트 ZIP 인쇄·진행 확인을 할 수 있다.
+  - 허용된 출처(ALLOWED_ORIGINS)의 요청만 받는다.
 
 구조
   - 접속자마다 자기만의 화면(파일 목록)을 가짐 — 서로 안 섞임
@@ -24,12 +30,15 @@
 인터넷에 직접 공개하지 마세요.
 """
 
+import json
 import os
 import queue
+import shutil
 import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from collections import deque
 from pathlib import Path
 
@@ -37,17 +46,48 @@ import pythoncom
 import win32com.client
 import win32print
 
-from nicegui import ui
+from fastapi import File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from nicegui import app, ui
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "hwp_print_web_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-PORT = 8080
+PORT = 58021          # Lab 연동용 고정 포트 (8080은 충돌이 잦아 변경)
+AGENT_VERSION = "1.1.0"
+
+# Lab(웹 관리자 페이지)이 브라우저에서 이 프로그램(127.0.0.1)으로 직접
+# 요청을 보낼 수 있게 허용할 출처(Origin) 목록.
+# 여기 없는 사이트가 보낸 API 요청은 거절한다 (악성 사이트의 몰래 인쇄 방지).
+ALLOWED_ORIGINS = [
+    "https://app.dayoungmathclass.com",
+    # Lab 로컬 개발 서버
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:3001", "http://127.0.0.1:3001",
+    # 이 프로그램 자신의 화면
+    f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}",
+]
+
+HWP_EXTENSIONS = (".hwp", ".hwpx")
 
 
 # ============================================================
 # 공통 HWP 처리 로직
 # ============================================================
+class FileResult:
+    """파일 하나의 처리 결과. bool()은 성공 여부, 속성은 상세 정보."""
+
+    def __init__(self, ok, split_page=None, total_pages=None,
+                 skipped_no_endnote=False):
+        self.ok = ok
+        self.split_page = split_page
+        self.total_pages = total_pages
+        self.skipped_no_endnote = skipped_no_endnote
+
+    def __bool__(self):
+        return self.ok
+
+
 class HwpPrinter:
     """한글 문서 열기, 미주 탐색, 본문/답지 분할 인쇄 담당."""
 
@@ -210,8 +250,13 @@ class HwpPrinter:
 
     # ---------- 인쇄 ----------
     def _print_range(self, print_act, print_set, printer_name, page_range,
-                     copies):
+                     copies, dry_run=False):
         """지정 범위를 지정 부수(NumCopy)만큼 한 번에 인쇄."""
+        if dry_run:
+            # 검사 모드: 분할 계산까지만 하고 실제 인쇄는 하지 않는다
+            self.log(f"   🧪 (검사) {page_range}쪽 · {copies}부 "
+                     f"→ {printer_name} — 실제 인쇄 안 함")
+            return
         print_act.GetDefault(print_set)
         print_set.SetItem("Collate", 1)  # 한 부씩 정렬
         print_set.SetItem("UsingPagenum", 0)
@@ -225,7 +270,7 @@ class HwpPrinter:
 
     def execute_print(self, split_page, total_pages, printer_body,
                       printer_answer, body_copies, answer_copies,
-                      answer_upto=None):
+                      answer_upto=None, dry_run=False):
         """본문과 답지를 각각 해당 프린터로 보낸다.
 
         answer_upto: 답지를 몇 번 문제의 답까지만 인쇄할지 (None이면 전체).
@@ -249,7 +294,7 @@ class HwpPrinter:
             if split_page > 1 and body_copies > 0:
                 body_range = f"1-{split_page - 1}"
                 self._print_range(print_act, print_set, printer_body,
-                                  body_range, body_copies)
+                                  body_range, body_copies, dry_run=dry_run)
                 self.log(f"   🖨️ 본문 {body_range}쪽 · {body_copies}부 "
                          f"→ {printer_body}")
             elif body_copies == 0:
@@ -259,7 +304,8 @@ class HwpPrinter:
             if split_page <= answer_last and answer_copies > 0:
                 answer_range = f"{split_page}-{answer_last}"
                 self._print_range(print_act, print_set, printer_answer,
-                                  answer_range, answer_copies)
+                                  answer_range, answer_copies,
+                                  dry_run=dry_run)
                 self.log(f"   🖨️ 답지 {answer_range}쪽{upto_label} · "
                          f"{answer_copies}부 → {printer_answer}")
             elif answer_copies == 0:
@@ -271,7 +317,7 @@ class HwpPrinter:
             return False
 
     def execute_whole_print(self, total_pages, printer_body, printer_answer,
-                            body_copies, answer_copies):
+                            body_copies, answer_copies, dry_run=False):
         """미주 분할 없이 전체 페이지를 양쪽 프린터로 지정 부수만큼 인쇄."""
         try:
             print_act = self.hwp.CreateAction("Print")
@@ -280,7 +326,7 @@ class HwpPrinter:
 
             if body_copies > 0:
                 self._print_range(print_act, print_set, printer_body,
-                                  whole_range, body_copies)
+                                  whole_range, body_copies, dry_run=dry_run)
                 self.log(f"   🖨️ 전체 {whole_range}쪽 · {body_copies}부 "
                          f"→ {printer_body}")
             else:
@@ -288,7 +334,7 @@ class HwpPrinter:
 
             if answer_copies > 0:
                 self._print_range(print_act, print_set, printer_answer,
-                                  whole_range, answer_copies)
+                                  whole_range, answer_copies, dry_run=dry_run)
                 self.log(f"   🖨️ 전체 {whole_range}쪽 · {answer_copies}부 "
                          f"→ {printer_answer}")
             else:
@@ -302,12 +348,12 @@ class HwpPrinter:
     # ---------- 단일 파일 처리 ----------
     def process_file(self, file_path, body_copies, answer_copies, do_split,
                      printer_body, printer_answer, on_no_endnote=None,
-                     answer_upto=None):
-        """파일 하나를 열어 분할/전체 모드에 따라 인쇄한다."""
+                     answer_upto=None, dry_run=False):
+        """파일 하나를 열어 분할/전체 모드에 따라 인쇄한다. FileResult 반환."""
         try:
             if not self.hwp.Open(file_path, "", ""):
                 self.log("   ❌ 파일을 열지 못했습니다.")
-                return False
+                return FileResult(False)
 
             total_pages = self.hwp.PageCount
 
@@ -321,17 +367,22 @@ class HwpPrinter:
                     if on_no_endnote:
                         on_no_endnote(os.path.basename(file_path))
                     self.hwp.Run("FileClose")
-                    return False
+                    return FileResult(False, total_pages=total_pages,
+                                      skipped_no_endnote=True)
 
-                result = self.execute_print(split_page, total_pages,
-                                            printer_body, printer_answer,
-                                            body_copies, answer_copies,
-                                            answer_upto=answer_upto)
+                ok = self.execute_print(split_page, total_pages,
+                                        printer_body, printer_answer,
+                                        body_copies, answer_copies,
+                                        answer_upto=answer_upto,
+                                        dry_run=dry_run)
+                result = FileResult(ok, split_page=split_page,
+                                    total_pages=total_pages)
             else:
                 self.log(f"   📑 전체 인쇄 모드 ({total_pages}쪽)")
-                result = self.execute_whole_print(total_pages, printer_body,
-                                                  printer_answer, body_copies,
-                                                  answer_copies)
+                ok = self.execute_whole_print(total_pages, printer_body,
+                                              printer_answer, body_copies,
+                                              answer_copies, dry_run=dry_run)
+                result = FileResult(ok, total_pages=total_pages)
 
             self.hwp.Run("FileClose")
             return result
@@ -341,7 +392,7 @@ class HwpPrinter:
                 self.hwp.Run("FileClose")
             except Exception:
                 pass
-            return False
+            return FileResult(False)
 
 
 # ============================================================
@@ -373,9 +424,74 @@ class AppState:
         self.status = "대기 중..."
 
 
+class LabJobRegistry:
+    """Lab에서 접수한 인쇄 작업의 상태·로그 저장소 (스레드 안전).
+
+    NiceGUI 화면에서 넣은 작업은 여기 등록되지 않는다 (기존 동작 유지).
+    """
+
+    def __init__(self):
+        self._jobs = {}
+        self._lock = threading.Lock()
+
+    def create(self, label, files, printer_body, printer_answer, dry_run):
+        job_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._jobs[job_id] = {
+                "id": job_id,
+                "label": label,
+                # queued | printing | done | failed | cancelled
+                "status": "queued",
+                "dry_run": dry_run,
+                "printer_body": printer_body,
+                "printer_answer": printer_answer,
+                "created_at": time.time(),
+                "finished_at": None,
+                "cancel_requested": False,
+                "files": files,
+                "logs": [],
+            }
+        return job_id
+
+    def get(self, job_id):
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def log(self, job_id, line):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["logs"].append(f"[{time.strftime('%H:%M:%S')}] {line}")
+
+    def update(self, job_id, **fields):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.update(fields)
+
+    def update_file(self, job_id, index, **fields):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None and 0 <= index < len(job["files"]):
+                job["files"][index].update(fields)
+
+    def snapshot(self, job_id, since_log=0):
+        """API 응답용 복사본. logs는 since_log 이후 것만 담는다."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            data = {k: v for k, v in job.items() if k != "logs"}
+            data["files"] = [dict(f) for f in job["files"]]
+            data["logs"] = list(job["logs"][since_log:])
+            data["log_total"] = len(job["logs"])
+            return data
+
+
 glog = GlobalLog()
 state = AppState()
-job_queue = queue.Queue()  # 항목: {'label', 'jobs', 'printer_body', 'printer_answer'}
+lab_jobs = LabJobRegistry()
+job_queue = queue.Queue()  # 항목: {'label', 'jobs', 'printer_body', 'printer_answer', ...}
 
 log = glog.add
 
@@ -390,61 +506,130 @@ def get_printer_list():
 # ============================================================
 # 인쇄 워커 — 서버에 하나만 떠서 대기열을 순서대로 처리
 # ============================================================
+def _cleanup_batch(batch):
+    """배치가 쓰던 업로드 임시 파일·폴더를 정리한다."""
+    for path, *_ in batch["jobs"]:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    for d in batch.get("cleanup_dirs", []):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def worker_loop():
     pythoncom.CoInitialize()
     while True:
         batch = job_queue.get()  # 작업이 들어올 때까지 대기
+        job_id = batch.get("job_id")  # Lab에서 접수한 작업이면 ID가 있다
+        job = lab_jobs.get(job_id) if job_id else None
+
+        # 대기 중에 취소된 Lab 작업은 실행하지 않고 정리만 한다
+        if job is not None and job["cancel_requested"]:
+            lab_jobs.update(job_id, status="cancelled",
+                            finished_at=time.time())
+            lab_jobs.log(job_id, "🚫 시작 전에 취소되었습니다.")
+            log(f"🚫 '{batch['label']}' 작업이 시작 전에 취소되었습니다.")
+            _cleanup_batch(batch)
+            job_queue.task_done()
+            continue
+
         state.running = True
         state.stop_flag = False
         state.progress = 0.0
 
         jobs = batch["jobs"]
         label = batch["label"]
-        printer = HwpPrinter(log)
+        dry_run = batch.get("dry_run", False)
+
+        def blog(message):
+            """공용 로그 + (Lab 작업이면) 작업별 로그에 동시 기록."""
+            log(message)
+            if job_id:
+                lab_jobs.log(job_id, message)
+
+        printer = HwpPrinter(blog)
         skipped_files = []
+        cancelled = False
+        total = len(jobs)
+        success = 0
+
+        if job is not None:
+            lab_jobs.update(job_id, status="printing")
 
         try:
-            log(f"▶️ '{label}' 작업 시작 — 파일 {len(jobs)}건 "
-                f"(대기 중 {job_queue.qsize()}건)")
+            blog(f"▶️ '{label}' 작업 시작 — 파일 {total}건 "
+                 f"(대기 중 {job_queue.qsize()}건)"
+                 + (" [검사 모드 — 실제 인쇄 안 함]" if dry_run else ""))
             printer.start()
 
-            total = len(jobs)
-            success = 0
             for i, (path, name, body_copies, answer_copies, do_split,
                     answer_upto) in enumerate(jobs):
-                if state.stop_flag:
-                    log("⚠️ 중단 요청으로 현재 작업을 멈췄습니다.")
+                current = lab_jobs.get(job_id) if job_id else None
+                if state.stop_flag or (current is not None
+                                       and current["cancel_requested"]):
+                    blog("⚠️ 중단 요청으로 현재 작업을 멈췄습니다.")
+                    cancelled = True
                     break
 
                 mode_label = "분할" if do_split else "전체"
                 upto_label = f" / 답지 {answer_upto}번까지" if answer_upto else ""
                 state.progress = i / total
                 state.status = f"[{label}] 처리 중: {name}"
-                log(f"📄 [{i + 1}/{total}] {name} [{mode_label}] "
-                    f"(본문 {body_copies}부 / 답지 {answer_copies}부"
-                    f"{upto_label})")
+                blog(f"📄 [{i + 1}/{total}] {name} [{mode_label}] "
+                     f"(본문 {body_copies}부 / 답지 {answer_copies}부"
+                     f"{upto_label})")
+                if job_id:
+                    lab_jobs.update_file(job_id, i, status="printing")
 
-                if printer.process_file(path, body_copies, answer_copies,
-                                        do_split, batch["printer_body"],
-                                        batch["printer_answer"],
-                                        on_no_endnote=skipped_files.append,
-                                        answer_upto=answer_upto):
+                result = printer.process_file(
+                    path, body_copies, answer_copies, do_split,
+                    batch["printer_body"], batch["printer_answer"],
+                    on_no_endnote=skipped_files.append,
+                    answer_upto=answer_upto, dry_run=dry_run)
+                if result:
                     success += 1
+                if job_id:
+                    if result:
+                        fstatus = "done"
+                    elif result.skipped_no_endnote:
+                        fstatus = "skipped_no_endnote"
+                    else:
+                        fstatus = "failed"
+                    lab_jobs.update_file(job_id, i, status=fstatus,
+                                         split_page=result.split_page,
+                                         total_pages=result.total_pages)
 
             state.progress = 1.0
-            log(f"✅ '{label}' 완료 — 성공 {success} / 전체 {total}건")
+            blog(f"✅ '{label}' 완료 — 성공 {success} / 전체 {total}건")
             if skipped_files:
-                log(f"⏭️ 미주가 없어 건너뛴 파일 {len(skipped_files)}개: "
-                    + ", ".join(skipped_files))
+                blog(f"⏭️ 미주가 없어 건너뛴 파일 {len(skipped_files)}개: "
+                     + ", ".join(skipped_files))
+            if job_id:
+                if cancelled:
+                    final = "cancelled"
+                elif success == 0 and total > 0:
+                    final = "failed"
+                else:
+                    final = "done"
+                lab_jobs.update(job_id, status=final,
+                                finished_at=time.time())
+                # 처리되지 못한 파일 상태 정리
+                snapshot = lab_jobs.get(job_id)
+                if snapshot is not None:
+                    for idx, f in enumerate(snapshot["files"]):
+                        if f["status"] in ("pending", "printing"):
+                            lab_jobs.update_file(
+                                job_id, idx,
+                                status="cancelled" if cancelled else "failed")
         except Exception as e:
-            log(f"❌ '{label}' 처리 중 오류: {e}")
+            blog(f"❌ '{label}' 처리 중 오류: {e}")
+            if job_id:
+                lab_jobs.update(job_id, status="failed",
+                                finished_at=time.time())
         finally:
             printer.quit()
-            for path, *_ in jobs:  # 업로드 임시 파일 정리
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            _cleanup_batch(batch)
             state.running = False
             state.status = ("대기 중..." if job_queue.empty()
                             else f"다음 작업 준비 중 (대기 {job_queue.qsize()}건)")
@@ -692,6 +877,244 @@ async def index():
 
     await ui.context.client.connected()
     ui.run_javascript(_FOLDER_PICKER_JS)
+
+
+# ============================================================
+# Lab 연동 API — Lab(https://app.dayoungmathclass.com) 페이지가
+# 브라우저에서 http://127.0.0.1:58021 로 직접 호출하는 창구.
+# 브라우저는 localhost 통신을 혼합 콘텐츠 차단 예외로 허용한다.
+# ============================================================
+# allow_private_network: 공개 사이트(Lab)가 사설 주소(127.0.0.1)로 요청하는
+# Chrome PNA 사전 요청을 허용 (Starlette가 허용 헤더를 자동으로 붙인다)
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                   allow_methods=["*"], allow_headers=["*"],
+                   allow_private_network=True)
+
+
+def _check_origin(request: Request):
+    """허용 목록 밖의 웹사이트가 보낸 요청을 거절한다.
+
+    Origin 헤더가 아예 없는 요청(주소창 직접 입력, curl 등 브라우저 밖
+    도구)은 이 PC 사용자의 직접 행동이므로 허용한다.
+    """
+    origin = request.headers.get("origin")
+    if origin is not None and origin not in ALLOWED_ORIGINS:
+        raise HTTPException(status_code=403, detail="허용되지 않은 출처입니다.")
+
+
+def _parse_copies(value, default=1):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_upto(value):
+    try:
+        n = int(value)
+        return n if n >= 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_printers(printer_body, printer_answer):
+    available = get_printer_list()
+    for name in (printer_body, printer_answer):
+        if name not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"프린터 '{name}'를 이 PC에서 찾을 수 없습니다.")
+
+
+def _enqueue_lab_job(label, entries, printer_body, printer_answer,
+                     dry_run, cleanup_dirs=None):
+    """entries: [(path, name, body, answer, do_split, upto)] → 작업 등록."""
+    files_meta = [{
+        "name": name,
+        "do_split": do_split,
+        "body_copies": body,
+        "answer_copies": answer,
+        "answer_upto": upto,
+        "status": "pending",
+        "split_page": None,
+        "total_pages": None,
+    } for (_path, name, body, answer, do_split, upto) in entries]
+
+    job_id = lab_jobs.create(label, files_meta, printer_body,
+                             printer_answer, dry_run)
+    job_queue.put({
+        "label": label,
+        "jobs": [(str(p), n, b, a, s, u) for (p, n, b, a, s, u) in entries],
+        "printer_body": printer_body,
+        "printer_answer": printer_answer,
+        "job_id": job_id,
+        "dry_run": dry_run,
+        "cleanup_dirs": cleanup_dirs or [],
+    })
+    log(f"📥 [Lab] '{label}' 작업 {len(entries)}건 대기열 추가"
+        + (" (검사 모드)" if dry_run else ""))
+    return job_id
+
+
+@app.get("/api/health")
+def api_health(request: Request):
+    _check_origin(request)
+    return {
+        "ok": True,
+        "app": "강다영수학 프린트 도우미",
+        "version": AGENT_VERSION,
+        "running": state.running,
+        "queue_size": job_queue.qsize(),
+        "status": state.status,
+    }
+
+
+@app.get("/api/printers")
+def api_printers(request: Request):
+    _check_origin(request)
+    try:
+        default = win32print.GetDefaultPrinter()
+    except Exception:
+        default = None
+    return {"printers": get_printer_list(), "default": default}
+
+
+@app.post("/api/jobs")
+async def api_create_job(request: Request,
+                         files: list[UploadFile] = File(...),
+                         items: str = Form("[]"),
+                         printer_body: str = Form(...),
+                         printer_answer: str = Form(...),
+                         label: str = Form("Lab"),
+                         dry_run: str = Form("0")):
+    """파일 여러 개 + 파일별 옵션(items JSON 배열, files와 같은 순서)."""
+    _check_origin(request)
+    _validate_printers(printer_body, printer_answer)
+    try:
+        opts = json.loads(items)
+        if not isinstance(opts, list):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail="items는 JSON 배열이어야 합니다.")
+
+    entries = []
+    try:
+        for idx, upload in enumerate(files):
+            o = opts[idx] if idx < len(opts) and isinstance(opts[idx], dict) \
+                else {}
+            # 파일명은 items의 name을 우선 사용 (JSON은 인코딩이 항상
+            # UTF-8이라, multipart 파일명 인코딩 차이로 깨질 일이 없다)
+            name = os.path.basename(
+                str(o.get("name") or upload.filename or f"파일{idx + 1}"))
+            if not name.lower().endswith(HWP_EXTENSIONS):
+                raise HTTPException(status_code=400,
+                                    detail=f"'{name}'은 한글 파일(.hwp/.hwpx)이 "
+                                           f"아닙니다.")
+            dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{name}"
+            dest.write_bytes(await upload.read())
+            entries.append((dest, name,
+                            _parse_copies(o.get("body_copies")),
+                            _parse_copies(o.get("answer_copies")),
+                            bool(o.get("do_split", True)),
+                            _parse_upto(o.get("answer_upto"))))
+    except HTTPException:
+        for path, *_ in entries:
+            Path(path).unlink(missing_ok=True)
+        raise
+    if not entries:
+        raise HTTPException(status_code=400, detail="파일이 없습니다.")
+
+    job_id = _enqueue_lab_job(label.strip() or "Lab", entries,
+                              printer_body, printer_answer, dry_run == "1")
+    return {"job_id": job_id}
+
+
+@app.post("/api/jobs/zip")
+async def api_create_job_zip(request: Request,
+                             file: UploadFile = File(...),
+                             printer_body: str = Form(...),
+                             printer_answer: str = Form(...),
+                             label: str = Form("Lab"),
+                             do_split: str = Form("1"),
+                             body_copies: str = Form("1"),
+                             answer_copies: str = Form("1"),
+                             answer_upto: str = Form(""),
+                             dry_run: str = Form("0")):
+    """ZIP 하나(예: 오답노트 묶음)를 풀어 안의 한글 파일 전체를 공통
+    옵션으로 인쇄한다."""
+    _check_origin(request)
+    _validate_printers(printer_body, printer_answer)
+
+    zip_path = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_upload.zip"
+    zip_path.write_bytes(await file.read())
+    extract_dir = UPLOAD_DIR / f"zip_{uuid.uuid4().hex[:8]}"
+    extract_dir.mkdir()
+
+    entries = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                raw_name = info.filename
+                # UTF-8 플래그가 없는 ZIP의 한글 파일명 복원 (cp437→cp949)
+                if not info.flag_bits & 0x800:
+                    try:
+                        raw_name = raw_name.encode("cp437").decode("cp949")
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        pass
+                base = os.path.basename(raw_name)
+                if not base.lower().endswith(HWP_EXTENSIONS):
+                    continue
+                dest = extract_dir / f"{len(entries):03d}_{base}"
+                with zf.open(info) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                entries.append((dest, base,
+                                _parse_copies(body_copies),
+                                _parse_copies(answer_copies),
+                                do_split == "1",
+                                _parse_upto(answer_upto)))
+    except zipfile.BadZipFile:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        zip_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="ZIP 파일이 아닙니다.")
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+    if not entries:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HTTPException(status_code=400,
+                            detail="ZIP 안에 한글 파일(.hwp/.hwpx)이 없습니다.")
+
+    entries.sort(key=lambda e: e[1])  # 파일명(학생 이름)순 인쇄
+    job_id = _enqueue_lab_job(label.strip() or "Lab", entries,
+                              printer_body, printer_answer, dry_run == "1",
+                              cleanup_dirs=[str(extract_dir)])
+    return {"job_id": job_id, "file_count": len(entries)}
+
+
+@app.get("/api/jobs/{job_id}")
+def api_get_job(request: Request, job_id: str, since_log: int = 0):
+    _check_origin(request)
+    snapshot = lab_jobs.snapshot(job_id, since_log=max(0, since_log))
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    snapshot["queue_size"] = job_queue.qsize()
+    return snapshot
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_cancel_job(request: Request, job_id: str):
+    _check_origin(request)
+    job = lab_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if job["status"] in ("done", "failed", "cancelled"):
+        return {"ok": True, "status": job["status"]}
+    lab_jobs.update(job_id, cancel_requested=True)
+    lab_jobs.log(job_id, "🛑 취소 요청됨")
+    return {"ok": True, "status": job["status"]}
 
 
 if __name__ in {"__main__", "__mp_main__"}:

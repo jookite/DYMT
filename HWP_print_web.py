@@ -118,17 +118,36 @@ class HwpPrinter:
             self.hwp = None
 
     # ---------- 미주 탐색 ----------
-    def _note_shown_page(self, ctrl, at_end=False):
-        """미주 내용의 시작(또는 끝) 위치에 표시되는 쪽 번호."""
+    def _cur_page(self):
+        """커서가 있는 물리 쪽(1부터). 표시 쪽 번호('새 쪽번호')와 무관."""
+        info = self.hwp.XHwpDocuments.Active_XHwpDocument.XHwpDocumentInfo
+        return info.CurrentPage + 1
+
+    def _anchor_page(self, ctrl):
+        """미주 번호가 달린 본문(문제) 위치의 물리 쪽."""
+        self.hwp.SetPosBySet(ctrl.GetAnchorPos(0))
+        return self._cur_page()
+
+    def _note_page(self, ctrl, at_end=False):
+        """미주 내용(답)의 시작(또는 끝) 위치의 물리 쪽."""
         self.hwp.SetPosBySet(ctrl.GetAnchorPos(0))
         self.hwp.Run("NoteModify")        # 미주 내용 위치로 이동
         if at_end:
             self.hwp.Run("MoveSelListEnd")
-        page = self.hwp.KeyIndicator()[3]
+        page = self._cur_page()
         if at_end:
             self.hwp.Run("Cancel")
         self.hwp.Run("CloseUpper")        # 본문으로 복귀
         return page
+
+    def _endnotes(self):
+        ens = []
+        ctrl = self.hwp.HeadCtrl
+        while ctrl:
+            if ctrl.CtrlID == "en":
+                ens.append(ctrl)
+            ctrl = ctrl.Next
+        return ens
 
     COVER_KEYWORDS = ("정답", "해설", "답지")  # 답지 표지 제목에 흔한 단어
 
@@ -144,106 +163,47 @@ class HwpPrinter:
             return ""
 
     def find_split_page_by_first_endnote(self):
-        """답지가 시작되는 실제(물리) 쪽 번호를 계산 (미주 없으면 None).
+        """답지가 시작되는 물리 쪽 번호를 계산 (미주 없으면 None).
 
-        GetPageText()는 미주 내용을 제외한 본문 텍스트를 물리 쪽 단위로
-        돌려주므로, 문서 끝에서부터 본문 텍스트가 남아 있는 마지막 쪽(E)을
-        찾는다. E 첫머리에 '정답/해설/답지' 류 제목이 있으면 답지 표지로
-        보고 E부터, 아니면 본문 마지막 쪽이므로 E+1부터를 답지로 삼는다.
-        표시 쪽 번호를 쓰지 않아 '새 쪽번호' 문서에서도 안전하다.
-        모든 쪽에 글자가 있으면(머리말 등) 표시 번호 차이 방식으로 대체.
+        - L: 마지막 미주가 달린 문제가 있는 쪽 (본문은 최소 L쪽까지)
+        - F: 첫 미주 내용(답)이 시작되는 쪽 (답지는 늦어도 F쪽부터)
+        L과 F 사이 쪽 중 '정답/해설/답지' 제목이 있는 첫 쪽이 답지 표지,
+        없으면 F부터 답지. 사이의 빈 쪽(그림·수식만 있거나 풀이 공간)은
+        본문으로 남는다. 물리 쪽만 쓰므로 '새 쪽번호' 문서에서도 안전하다.
         """
         self.log("   🔍 분할 위치(미주) 탐색 중...")
-
-        items = []
-        ctrl = self.hwp.HeadCtrl
-        while ctrl:
-            items.append((ctrl.CtrlID, ctrl))
-            ctrl = ctrl.Next
-        en_idx = [i for i, (cid, _) in enumerate(items) if cid == "en"]
-        if not en_idx:
+        ens = self._endnotes()
+        if not ens:
             return None
-        first_en = items[en_idx[0]][1]
-        last_en = items[en_idx[-1]][1]
-        boundary = next((c for i, (cid, c) in enumerate(items)
-                         if cid in ("secd", "nwno") and i > en_idx[-1]), None)
-
         try:
-            total_pages = self.hwp.PageCount
-            last_body = None
-            for pg in range(total_pages, 0, -1):
-                if self._page_text(pg):
-                    last_body = pg
-                    break
-            if last_body is None or last_body == total_pages:
-                return self._split_by_span(first_en, last_en, boundary,
-                                           total_pages)
-
-            def is_cover(pg):
-                head = self._page_text(pg)[:100]
-                return any(k in head for k in self.COVER_KEYWORDS)
-
-            if is_cover(last_body):
-                # 답지 앞부분(표지·빠른정답 등)이 본문 텍스트로 여러 쪽
-                # 이어질 수 있어, 키워드가 나오는 동안 최대 4쪽까지 소급
-                split_page = last_body
-                for pg in range(last_body - 1, max(0, last_body - 4), -1):
-                    if is_cover(pg):
-                        split_page = pg
-                    else:
-                        break
-                basis = "답지 표지 기준"
-            else:
-                split_page = last_body + 1    # 본문 다음 쪽부터
-                basis = "본문 끝 기준"
+            last_problem = self._anchor_page(ens[-1])
+            first_answer = self._note_page(ens[0])
+            split_page = next(
+                (pg for pg in range(last_problem + 1, first_answer)
+                 if any(k in self._page_text(pg)[:100]
+                        for k in self.COVER_KEYWORDS)),
+                first_answer)
+            basis = ("답지 표지 기준" if split_page < first_answer
+                     else "첫 미주 기준")
             self.log(f"   📍 분할 지점: {split_page}쪽 ({basis})")
-            return split_page
-        except Exception as e:
-            self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
-            return None
-
-    def _split_by_span(self, first_en, last_en, boundary, total_pages):
-        """예비 방식: 답지 영역이 문서 끝에 이어붙는 점을 이용해
-        (전체 쪽수 - 답지 영역 쪽수 + 1)로 계산. 영역 쪽수는 표시 번호의
-        차이로 구하므로 '새 쪽번호' 오프셋이 상쇄된다."""
-        try:
-            end_shown = self._note_shown_page(last_en, at_end=True)
-            if boundary is not None:
-                self.hwp.SetPosBySet(boundary.GetAnchorPos(0))
-                start_shown = self.hwp.KeyIndicator()[3]
-            else:
-                start_shown = self._note_shown_page(first_en)
-            tail_pages = end_shown - start_shown + 1
-            if not 1 <= tail_pages <= total_pages:
-                raise ValueError(
-                    f"답지 영역 계산 이상 (표시 번호 시작 {start_shown}쪽 / "
-                    f"끝 {end_shown}쪽 / 전체 {total_pages}쪽)")
-            split_page = total_pages - tail_pages + 1
-            self.log(f"   📍 분할 지점: {split_page}쪽 (표시 번호 기준)")
+            if first_answer <= last_problem:
+                self.log(f"   ⚠️ 마지막 문제와 첫 답이 같은 쪽({first_answer}쪽)"
+                         f"에 있어 그 쪽은 답지로만 인쇄됩니다")
             return split_page
         except Exception as e:
             self.log(f"   ⚠️ 미주 분석 중 오류: {e}")
             return None
 
     def find_answer_end_page(self, upto_num, total_pages):
-        """upto_num번째 미주(문제)의 답이 끝나는 실제 쪽 번호.
+        """upto_num번째 미주(문제)의 답이 끝나는 물리 쪽 번호.
 
-        마지막 미주의 끝이 문서 마지막 쪽이라는 점을 기준으로,
-        표시 번호의 차이만큼 문서 끝에서 되짚어 계산한다.
         문제 수 이상을 지정했거나 계산이 안 되면 None (→ 답지 전체 인쇄).
         """
-        ens = []
-        ctrl = self.hwp.HeadCtrl
-        while ctrl:
-            if ctrl.CtrlID == "en":
-                ens.append(ctrl)
-            ctrl = ctrl.Next
+        ens = self._endnotes()
         if not ens or upto_num < 1 or upto_num >= len(ens):
             return None
         try:
-            end_shown = self._note_shown_page(ens[-1], at_end=True)
-            k_shown = self._note_shown_page(ens[upto_num - 1], at_end=True)
-            page = total_pages - (end_shown - k_shown)
+            page = self._note_page(ens[upto_num - 1], at_end=True)
             if not 1 <= page <= total_pages:
                 return None
             return page

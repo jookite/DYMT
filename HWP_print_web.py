@@ -54,7 +54,7 @@ UPLOAD_DIR = Path(tempfile.gettempdir()) / "hwp_print_web_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 PORT = 58021          # Lab 연동용 고정 포트 (8080은 충돌이 잦아 변경)
-AGENT_VERSION = "1.1.1"
+AGENT_VERSION = "1.1.2"
 
 # Lab(웹 관리자 페이지)이 브라우저에서 이 프로그램(127.0.0.1)으로 직접
 # 요청을 보낼 수 있게 허용할 출처(Origin) 목록.
